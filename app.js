@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.0.2';
 const DEFAULT_LETTER = 'I';
 
 // ================================================================== small helpers
@@ -467,9 +467,18 @@ const Cam = {
   init() {
     this.box = document.createElement('div');
     this.box.className = 'cam';
-    this.box.innerHTML = '<video playsinline muted autoplay></video><div class="aim"></div><div class="camerr" hidden></div>';
+    this.box.innerHTML = '<video playsinline muted autoplay></video><div class="aim"></div><div class="aimbox"></div><div class="camerr" hidden></div>';
     this.video = this.box.querySelector('video');
+    this.canvas = document.createElement('canvas');
+    // In Button mode a tap on the picture also captures.
+    this.box.addEventListener('click', () => { if (this.captureMode()) this.capture(); });
     $('#camHolder').append(this.box);
+  },
+  captureMode: () => S.settings.scanMode !== 'auto',
+  /** Called after the scan mode changes: Auto reads continuously, Button reads only on Capture. */
+  applyMode() {
+    this.box.classList.toggle('capture', this.captureMode());
+    if (this.captureMode()) clearTimeout(this.timer); else if (this.stream) this.loop();
   },
   async setupDecoder() {
     if (this.detector || this.reader) return;
@@ -487,7 +496,6 @@ const Cam = {
     hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [F.CODE_128, F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_39, F.QR_CODE, F.DATA_MATRIX]);
     this.reader = new Z.MultiFormatReader();
     this.reader.setHints(hints);
-    this.canvas = document.createElement('canvas');
   },
   async start(onCode) {
     this.onCode = onCode;
@@ -504,7 +512,7 @@ const Cam = {
       this.video.srcObject = this.stream;
       await this.video.play().catch(() => {});
       err.hidden = true;
-      this.loop();
+      this.applyMode();
     } catch (e) {
       err.textContent = 'Camera not available: ' + (e.name === 'NotAllowedError' ? 'permission refused. Allow the camera for this app in Settings.' : e.message || e.name) +
         '\nYou can still use a Bluetooth scanner or type the code.';
@@ -520,7 +528,7 @@ const Cam = {
   },
   loop() {
     clearTimeout(this.timer);
-    if (!this.stream) return;
+    if (!this.stream || this.captureMode()) return;
     this.timer = setTimeout(async () => {
       try {
         const text = await this.decode();
@@ -532,20 +540,61 @@ const Cam = {
       this.loop();
     }, 120);
   },
-  async decode() {
+  /** Button mode: reads the code inside the red box (tries for up to 1.5 s). The same item can be captured again and again. */
+  async capture() {
+    if (this.capturing || !this.onCode) return;
+    if (!this.stream) { error('Camera is not running'); return; }
+    this.capturing = true;
+    this.box.classList.add('busy');
+    try {
+      for (let i = 0; i < 15; i++) {
+        const text = await this.decode(true).catch(() => null);
+        if (text) {
+          this.box.classList.add('hit'); setTimeout(() => this.box.classList.remove('hit'), 250);
+          this.onCode(text, true);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      error('No barcode read – move closer so one code fills most of the red box, then tap Capture again');
+    } finally { this.capturing = false; this.box.classList.remove('busy'); }
+  },
+  /** crop = only the part of the picture inside the red box (Button mode). A neighbouring label cut by the
+   *  edge of the box can stop the reader, so narrower centred strips are tried too. */
+  async decode(crop = false) {
     const v = this.video;
     if (v.readyState < 2 || !v.videoWidth) return null;
-    if (this.detector) {
-      const found = await this.detector.detect(v);
-      return found.length ? found[0].rawValue : null;
+    if (!crop) {
+      if (this.detector) { const found = await this.detector.detect(v); return found.length ? found[0].rawValue : null; }
+      return this.decodeRegion(0, 0, v.videoWidth, v.videoHeight);
     }
-    const Z = window.ZXing;
-    const k = Math.min(1, 960 / v.videoWidth);
-    const w = Math.round(v.videoWidth * k), h = Math.round(v.videoHeight * k);
+    // The video fills the box (object-fit: cover); the red box is 56 % x 44 % of the visible picture, centred.
+    const bw = this.box.clientWidth || 1, bh = this.box.clientHeight || 1;
+    const scale = Math.max(bw / v.videoWidth, bh / v.videoHeight);
+    const W = (bw * 0.56) / scale, H = (bh * 0.44) / scale;
+    for (const f of this.detector ? [1] : [1, 0.8, 0.66, 0.55, 0.45]) {
+      const sw = Math.round(W * f), sh = Math.round(H);
+      const text = await this.decodeRegion(Math.round((v.videoWidth - sw) / 2), Math.round((v.videoHeight - sh) / 2), sw, sh);
+      if (text) return text;
+    }
+    return null;
+  },
+  async decodeRegion(sx, sy, sw, sh) {
+    const v = this.video;
+    const k = Math.min(1, 960 / sw);
+    const w = Math.round(sw * k), h = Math.round(sh * k);
     const c = this.canvas;
     if (c.width !== w) c.width = w;
     if (c.height !== h) c.height = h;
-    c.getContext('2d', { willReadFrequently: true }).drawImage(v, 0, 0, w, h);
+    c.getContext('2d', { willReadFrequently: true }).drawImage(v, sx, sy, sw, sh, 0, 0, w, h);
+    if (this.detector) {
+      // Several codes found: take the one nearest the middle of the box.
+      const found = await this.detector.detect(c);
+      if (!found.length) return null;
+      const d = (b) => { const r = b.boundingBox; return Math.hypot(r.x + r.width / 2 - w / 2, r.y + r.height / 2 - h / 2); };
+      return found.sort((a, b2) => d(a) - d(b2))[0].rawValue;
+    }
+    const Z = window.ZXing;
     try {
       const bmp = new Z.BinaryBitmap(new Z.HybridBinarizer(new Z.HTMLCanvasElementLuminanceSource(c)));
       return this.reader.decodeWithState(bmp).getText();
@@ -806,6 +855,9 @@ function sessionCardHtml() {
     <div class="tiny">Since ${fmtDayTime(a.started)} · ${lines.length} line(s) · ${persons(lines)} person(s)</div></div>
     <button class="btn text" data-go="HISTORY">History</button><button class="btn text" data-act="endSession" ${S.cart.length ? 'disabled' : ''}>End</button></div>`;
 }
+const scanModeHtml = () => `<div class="seg" style="margin-top:0">${[['capture', 'Button (one by one)'], ['auto', 'Auto']].map(([m, t]) =>
+  `<button data-act="scanMode" data-m="${m}" class="${(S.settings.scanMode !== 'auto') === (m === 'capture') ? 'on' : ''}">${t}</button>`).join('')}</div>`;
+const captureBtn = () => (Cam.captureMode() ? '<button class="btn full capbtn" data-act="capture">Capture</button>' : '');
 function issueHtml() {
   const p = S.person, l = S.lastLot;
   const left = l ? stockLeft(l) : null;
@@ -814,7 +866,7 @@ function issueHtml() {
     ${sessionCardHtml()}
     <div>
       <label class="row" style="min-height:44px"><span class="grow">Camera</span><input type="checkbox" class="switch" data-act="toggleCam" ${S.cameraOn ? 'checked' : ''}></label>
-      ${S.cameraOn ? '<div id="camSlot"></div>' : ''}
+      ${S.cameraOn ? `${scanModeHtml()}<div id="camSlot"></div>${captureBtn()}` : ''}
       <div class="row" style="margin-top:8px"><input type="text" id="manual" class="grow" placeholder="Type a code" value="${esc(S.manual)}" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false" enterkeyhint="done">
       <button class="btn text" data-act="manualEnter">Enter</button></div>
     </div>
@@ -915,7 +967,7 @@ function lotDetailHtml() {
     ${left != null ? info('In stock', Csv.fmt(left) + ' pieces') : ''}${info('Product barcodes', esc([...l.eans].join(', ') || 'none'))}
     <div class="info" style="align-items:center"><div class="l">Expiry date</div><div class="v grow">${l.expiry ? expiryHtml(l.expiry) : 'not set'}</div>
       <button class="btn text" data-act="askExpiry">${l.expiry ? 'Change' : 'Set'}</button>${l.expiry ? '<button class="btn text" data-act="clearExpiry">Clear</button>' : ''}</div></div>
-    ${S.waitingForEan ? `<div class="navy name">Scan the barcode printed on the product…</div><div id="camSlot"></div><button class="btn out" data-act="stopEan">Stop</button>`
+    ${S.waitingForEan ? `<div class="navy name">Scan the barcode printed on the product…</div>${scanModeHtml()}<div id="camSlot"></div>${captureBtn()}<button class="btn out" data-act="stopEan">Stop</button>`
     : `<div class="btnrow"><button class="btn" data-act="linkEan">Link product barcode</button><button class="btn out" data-act="unlinkEan" ${l.eans.size ? '' : 'disabled'}>Unlink</button></div>`}
     <p class="tiny">Tip: if the same product barcode is linked to several lots, the app shows their photos and ports so you can pick the right one.</p>
   </div>`;
@@ -1094,7 +1146,7 @@ function render() {
     CREW: crewHtml, DATA: dataHtml, EXPIRY: expiryScreenHtml,
   })[S.screen]();
   const slot = $('#camSlot');
-  if (slot) { slot.append(Cam.box); Cam.start((c) => onScan(c, true)); } else if (Cam.stream || Cam.onCode) Cam.stop();
+  if (slot) { slot.append(Cam.box); Cam.start((c, captured) => onScan(c, !captured)); Cam.applyMode(); } else if (Cam.stream || Cam.onCode) Cam.stop();
   setWake(S.screen === 'ISSUE');
   const m = $('#modal');
   const html = dialogHtml();
@@ -1180,6 +1232,8 @@ const ACT = {
     try { const n = await restoreZip(f); reload(); ok(`Restored ${n} file(s)`); } catch (e) { error('Restore failed: ' + e.message); }
     render();
   },
+  scanMode(el) { saveSetting('scanMode', el.dataset.m); render(); },
+  capture() { Cam.capture(); },
   showQr() { S.dialog = { type: 'qr' }; render(); },
   share: shareFile,
   download: downloadFile,

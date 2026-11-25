@@ -88,6 +88,13 @@ input:focus, select:focus { outline: 2px solid var(--navy); outline-offset: 0; b
 .cam .camerr { position: absolute; inset: 0; color: #fff; display: flex; align-items: center; justify-content: center;
   text-align: center; padding: 16px; font-size: 14px; }
 .cam.hit { box-shadow: 0 0 0 4px #2E9E5B inset; }
+.cam .aimbox { display: none; position: absolute; left: 22%; right: 22%; top: 28%; bottom: 28%;
+  border: 3px solid rgba(255,60,60,.95); border-radius: 6px; box-shadow: 0 0 0 999px rgba(0,0,0,.35); }
+.cam.capture { height: 220px; cursor: pointer; }
+.cam.capture .aim { display: none; }
+.cam.capture .aimbox { display: block; }
+.cam.busy .aimbox { border-color: #FFD54F; }
+.capbtn { min-height: 64px; font-size: 20px; margin-top: 8px; border-radius: 14px; }
 
 .exp { display: inline-block; margin-top: 2px; padding: 1px 6px; border-radius: 4px; color: #fff; font-weight: 600; font-size: 14px; }
 .exp.s { font-size: 12px; }

@@ -133,3 +133,4 @@ input:focus, select:focus { outline: 2px solid var(--navy); outline-offset: 0; b
 .dlg .acts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; padding: 10px 14px 16px; }
 .choice { display: flex; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); cursor: pointer; white-space: normal; }
 .person { padding: 12px 4px; border-bottom: 1px solid var(--line); cursor: pointer; white-space: normal; }
+.orange { color: var(--orange); }

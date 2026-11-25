@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const APP_VERSION = '1.0.4';
+const APP_VERSION = '1.0.5';
 const DEFAULT_LETTER = 'I';
 
 // ================================================================== small helpers
@@ -70,6 +70,12 @@ const Csv = {
     return String(r);
   },
 };
+/** Factor and report qty keep 10 decimals so 24 x (1/24) adds up to 1 in Bond Manager. */
+const fmtF = (v) => { const r = Math.round(v * 1e10) / 1e10; return String(r === 0 ? 0 : r); };
+/** Pieces in one unit for a factor below 1 (0.041667 -> 24). */
+const piecesOf = (f) => { const p = 1 / f; return Math.abs(p - Math.round(p)) < 1e-3 * p ? Math.round(p) : Math.round(p * 100) / 100; };
+/** 0.0416666667 -> "1/24", 0.5 -> "1/2", 2 -> "2". */
+const factorText = (f) => (f < 1 && Number.isInteger(piecesOf(f)) && Math.abs(1 / piecesOf(f) - f) < 1e-6 ? `1/${piecesOf(f)}` : Csv.fmt(f));
 /** First of the given columns that exists in the row (like Kotlin's r["a"] ?: r["b"]). */
 const col = (r, ...keys) => { for (const k of keys) if (r[k] !== undefined) return r[k]; return undefined; };
 
@@ -150,7 +156,7 @@ const DB = {
 // ================================================================== Repository (port of Repository.kt)
 /** In-memory copies of the data files (crew.csv, lots.csv, ...). Every change is written to IndexedDB. */
 const F = {};
-const DATA_FILES = ['crew.csv', 'lots.csv', 'eanmap.csv', 'names.csv', 'expiry.csv', 'sessions.csv', 'issues.csv', 'meta.properties'];
+const DATA_FILES = ['crew.csv', 'lots.csv', 'eanmap.csv', 'names.csv', 'expiry.csv', 'factors.csv', 'sessions.csv', 'issues.csv', 'meta.properties'];
 let photoKeys = new Set();
 const photoUrls = new Map();
 
@@ -219,16 +225,19 @@ function loadEanMap() {
 }
 function loadLots() {
   const extra = loadEanMap(), names = mapFile('names.csv', 'store_name'), exps = mapFile('expiry.csv', 'expiry');
+  const facs = mapFile('factors.csv', 'factor');
   return Csv.rows(F['lots.csv'] || '').map((r) => {
     const code = (r.lot_code || '').trim().toUpperCase();
     if (!code) return null;
     const eans = new Set(String(r.ean || '').split(/[ |/]/).map((x) => x.trim()).filter(Boolean));
     for (const e of extra.get(code) || []) eans.add(e);
-    const f = Csv.num(r.factor);
+    const f = Csv.num(r.factor), fp = Csv.num(facs.get(code));
     const lot = {
       lotCode: code, itemCode: r.item_code || '', description: r.description || '', port: r.port || '',
       priceUsd: Csv.num(col(r, 'price_usd', 'price')) ?? 0, unit: r.unit || '',
-      factor: f != null && f > 0 ? f : 1, eans,
+      // A factor changed on the phone (factors.csv) wins over the lots file.
+      factor: fp != null && fp > 0 ? fp : f != null && f > 0 ? f : 1, eans,
+      fileFactor: f != null && f > 0 ? f : 1, factorOnPhone: fp != null && fp > 0,
       stockAtImport: Csv.num(col(r, 'stock', 'rob')),
       storeName: names.has(code) ? names.get(code) : (r.store_name || '').trim(),
       // A date set on the phone (or cleared there) wins over the lots file.
@@ -244,12 +253,33 @@ function importLots(text) {
   if (rows[0].lot_code === undefined) throw new Error("Lots file needs a 'lot_code' column");
   saveFile('lots.csv', text.replace(/^﻿/, ''));
   setMeta('lotsImportTs', Date.now());
+  // Phone factors that the new lots file already has (e.g. after Bond Manager's Phone data) are no longer needed.
+  const facs = mapFile('factors.csv', 'factor');
+  if (facs.size) {
+    for (const r of rows) {
+      const k = (r.lot_code || '').trim().toUpperCase();
+      if (facs.has(k) && Csv.num(r.factor) != null && Math.abs(Csv.num(r.factor) - (Csv.num(facs.get(k)) ?? 0)) < 1e-6) facs.delete(k);
+    }
+    writeMap('factors.csv', ['lot_code', 'factor'], facs);
+  }
   return rows.filter((r) => (r.lot_code || '').trim()).length;
 }
 function writeMap(name, header, map) {
   saveFile(name, Csv.line(header) + '\n' + [...map.entries()].map(([k, v]) => Csv.line([k, v]) + '\n').join(''));
 }
 function repoSetExpiry(code, date) { const m = mapFile('expiry.csv', 'expiry'); m.set(code, date || ''); writeMap('expiry.csv', ['lot_code', 'expiry'], m); }
+function repoSetFactor(code, factor) {
+  const m = mapFile('factors.csv', 'factor');
+  if (factor == null) m.delete(code); else m.set(code, fmtF(factor));
+  writeMap('factors.csv', ['lot_code', 'factor'], m);
+}
+/** "0.041667", "1/24", "0,5" -> number > 0, else null. */
+function parseFactor(s) {
+  const t = String(s || '').trim().replace(/,/g, '.');
+  const m = t.match(/^(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)$/);
+  const v = m ? Number(m[1]) / Number(m[2]) : Csv.num(t);
+  return v != null && isFinite(v) && v > 0 ? Math.round(v * 1e10) / 1e10 : null;
+}
 function repoSetStoreName(code, name) {
   const m = mapFile('names.csv', 'store_name');
   if (!name.trim()) m.delete(code); else m.set(code, name.trim());
@@ -264,7 +294,7 @@ function repoSetEan(code, ean, add) {
 }
 function lotsExportText() {
   return '﻿' + Csv.line(LOTS_EXPORT_HEADER) + '\r\n' + S.lots.map((l) => Csv.line([
-    l.lotCode, l.itemCode, l.description, l.storeName, l.port, Csv.fmt(l.priceUsd), l.unit, Csv.fmt(l.factor),
+    l.lotCode, l.itemCode, l.description, l.storeName, l.port, Csv.fmt(l.priceUsd), l.unit, fmtF(l.factor),
     [...l.eans].sort().join(' '), l.expiry || '', l.stockAtImport != null ? Csv.fmt(l.stockAtImport) : '',
   ]) + '\r\n').join('');
 }
@@ -277,7 +307,7 @@ function issueLine(i) {
     i.id, i.sessionId, String(i.timestamp),
     ymd(d.getFullYear(), d.getMonth() + 1, d.getDate()), `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
     i.personCode, i.personName, i.reportColumn, i.lotCode, i.itemCode, i.description, i.port,
-    Csv.fmt(i.priceUsd), i.unit, Csv.fmt(i.qty), Csv.fmt(i.factor), Csv.fmt(reportQty(i)), i.note,
+    Csv.fmt(i.priceUsd), i.unit, Csv.fmt(i.qty), fmtF(i.factor), fmtF(reportQty(i)), i.note,
   ]);
 }
 function parseIssues() {
@@ -974,7 +1004,9 @@ function lotDetailHtml() {
     <div class="row" style="margin:6px 0"><input type="text" id="storeName" class="grow" placeholder="Store name (as on the product)" value="${esc(l.storeName)}" autocomplete="off">
       <button class="btn text" data-act="saveStoreName">Save</button></div>
     ${info('Port', esc(l.port))}${info('Price', `${Csv.fmt(l.priceUsd)} USD / ${esc(l.unit)}`)}${info('Item code', esc(l.itemCode))}
-    ${info('Lot code', esc(l.lotCode))}${info('Factor', `${Csv.fmt(l.factor)} ${esc(l.unit)} per scanned piece`)}
+    ${info('Lot code', esc(l.lotCode))}
+    <div class="info" style="align-items:center"><div class="l">Factor</div><div class="v grow">${factorText(l.factor)} ${esc(l.unit)} per scanned piece${l.factor < 1 ? ` <span class="small">(${piecesOf(l.factor)} pieces per ${esc(l.unit)})</span>` : ''}${l.factorOnPhone ? `<div class="tiny orange">Changed on this phone · lots file: ${factorText(l.fileFactor)}</div>` : ''}</div>
+      <button class="btn text" data-act="askFactor">Change</button></div>
     ${left != null ? info('In stock', Csv.fmt(left) + ' pieces') : ''}${info('Product barcodes', esc([...l.eans].join(', ') || 'none'))}
     <div class="info" style="align-items:center"><div class="l">Expiry date</div><div class="v grow">${l.expiry ? expiryHtml(l.expiry) : 'not set'}</div>
       <button class="btn text" data-act="askExpiry">${l.expiry ? 'Change' : 'Set'}</button>${l.expiry ? '<button class="btn text" data-act="clearExpiry">Clear</button>' : ''}</div></div>
@@ -1064,6 +1096,12 @@ function dlg(title, body, acts) {
   return `<div class="dlg" role="dialog" aria-modal="true"><h2>${esc(title)}</h2><div class="body">${body}</div><div class="acts">${acts}</div></div>`;
 }
 const b = (act, text, cls = 'text', extra = '') => `<button class="btn ${cls}" data-act="${act}" ${extra}>${esc(text)}</button>`;
+function factorPreview() {
+  const p = $('#facPreview'); if (!p) return;
+  const l = S.selectedLot, f = parseFactor($('#facValue').value);
+  p.innerHTML = f == null ? '<span class="red">Not a valid factor</span>'
+    : `Scanning 3 pieces → <b>${Csv.fmt(3 * f)} ${esc(l.unit)}</b> in the report` + (f < 1 ? ` · ${piecesOf(f)} pieces = 1 ${esc(l.unit)}` : '');
+}
 function dialogHtml() {
   if (!S.loaded) return '';
   if (S.showSessionPrompt) {
@@ -1108,6 +1146,18 @@ function dialogHtml() {
         const l = S.selectedLot;
         const v = l.expiry || plusMonths(todayYmd(), 6);
         return dlg('Earliest expiry / best before', `<div class="nowrap"><input type="date" id="expDate" value="${v}"></div>`, b('closeDlg', 'Cancel') + b('expirySave', 'Save', ''));
+      }
+      case 'factor': {
+        const l = S.selectedLot, u = esc(l.unit || 'unit');
+        return dlg('Factor per scanned piece', `<div class="nowrap">
+          <div class="small">One scan of this label = how many <b>${u}</b> in the bond report?</div>
+          <label class="small" style="display:block;margin-top:10px">Pieces in one ${u} (e.g. 24 cans in a case)</label>
+          <input type="text" id="facPieces" inputmode="decimal" autocomplete="off" value="${l.factor < 1 ? piecesOf(l.factor) : ''}">
+          <label class="small" style="display:block;margin-top:10px">or Factor (${u} per piece, e.g. 1/24 or 0.041667)</label>
+          <input type="text" id="facValue" inputmode="decimal" autocomplete="off" value="${factorText(l.factor)}">
+          <div class="small" id="facPreview" style="margin-top:8px"></div>
+          <div class="small orange" style="margin-top:8px">Only new scans use the new factor. Lines already issued keep theirs (reverse and scan again if they are wrong).${l.factorOnPhone ? `<br>Lots file value: ${factorText(l.fileFactor)}` : ''}</div></div>`,
+          b('closeDlg', 'Cancel') + (l.factorOnPhone ? b('factorReset', 'Use lots file') : '') + b('factorSave', 'Save', ''));
       }
       case 'qr': {
         const url = appUrl();
@@ -1206,6 +1256,19 @@ const ACT = {
     repoSetStoreName(l.lotCode, v); reload(); ok(v.trim() ? 'Store name saved' : 'Store name cleared'); render();
   },
   askExpiry() { S.dialog = { type: 'expiry' }; render(); },
+  askFactor() { S.dialog = { type: 'factor' }; render(); factorPreview(); },
+  factorSave() {
+    const l = S.selectedLot, f = parseFactor($('#facValue').value);
+    if (f == null) { error('Enter a factor above 0, e.g. 1, 0.5 or 1/24'); return; }
+    S.dialog = null;
+    repoSetFactor(l.lotCode, fmtF(f) === fmtF(l.fileFactor) ? null : f);
+    reload(); ok(`Factor for ${l.lotCode} set to ${factorText(f)} ${l.unit} per piece`); render();
+  },
+  factorReset() {
+    const l = S.selectedLot;
+    S.dialog = null; repoSetFactor(l.lotCode, null); reload();
+    ok(`Factor back to the lots file value ${factorText(l.fileFactor)}`); render();
+  },
   expirySave() {
     const v = $('#expDate').value;
     S.dialog = null;
@@ -1270,6 +1333,8 @@ function bindEvents() {
     if (t.id === 'histFilter') { S.hist.filter = t.value; $('#histList').innerHTML = histListHtml(); }
     else if (t.id === 'lotsFilter') { S.lotsFilter = t.value; $('#lotsList').innerHTML = lotsListHtml(); hydratePhotos($('#lotsList')); }
     else if (t.id === 'manual') S.manual = t.value;
+    else if (t.id === 'facPieces') { const n = parseFactor(t.value); if (n) $('#facValue').value = Number.isInteger(n) ? `1/${n}` : fmtF(1 / n); factorPreview(); }
+    else if (t.id === 'facValue') { const f = parseFactor(t.value); $('#facPieces').value = f && f < 1 ? piecesOf(f) : ''; factorPreview(); }
   });
   // Enter in the code field and in dialogs
   document.addEventListener('keydown', (e) => {
@@ -1278,6 +1343,7 @@ function bindEvents() {
     if (t.id === 'manual') { e.preventDefault(); ACT.manualEnter(); }
     else if (t.id === 'sessName') { e.preventDefault(); ACT.newStart(); }
     else if (t.id === 'storeName') { e.preventDefault(); ACT.saveStoreName(); t.blur(); }
+    else if (t.id === 'facValue' || t.id === 'facPieces') { e.preventDefault(); ACT.factorSave(); }
   });
   $('#back').addEventListener('click', back);
   $('#msg').addEventListener('click', () => { $('#msg').hidden = true; });

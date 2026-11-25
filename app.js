@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const APP_VERSION = '1.0.2';
+const APP_VERSION = '1.0.4';
 const DEFAULT_LETTER = 'I';
 
 // ================================================================== small helpers
@@ -556,7 +556,7 @@ const Cam = {
         }
         await new Promise((r) => setTimeout(r, 100));
       }
-      error('No barcode read – move closer so one code fills most of the red box, then tap Capture again');
+      error('No barcode read – fit the barcode inside the red frame (not smaller than it), then tap Capture again');
     } finally { this.capturing = false; this.box.classList.remove('busy'); }
   },
   /** crop = only the part of the picture inside the red box (Button mode). A neighbouring label cut by the
@@ -568,13 +568,24 @@ const Cam = {
       if (this.detector) { const found = await this.detector.detect(v); return found.length ? found[0].rawValue : null; }
       return this.decodeRegion(0, 0, v.videoWidth, v.videoHeight);
     }
-    // The video fills the box (object-fit: cover); the red box is 56 % x 44 % of the visible picture, centred.
+    // The video fills the box (object-fit: cover, centred). Map the red frame's on-screen rectangle to video pixels.
     const bw = this.box.clientWidth || 1, bh = this.box.clientHeight || 1;
     const scale = Math.max(bw / v.videoWidth, bh / v.videoHeight);
-    const W = (bw * 0.56) / scale, H = (bh * 0.44) / scale;
-    for (const f of this.detector ? [1] : [1, 0.8, 0.66, 0.55, 0.45]) {
-      const sw = Math.round(W * f), sh = Math.round(H);
-      const text = await this.decodeRegion(Math.round((v.videoWidth - sw) / 2), Math.round((v.videoHeight - sh) / 2), sw, sh);
+    const offX = (v.videoWidth * scale - bw) / 2, offY = (v.videoHeight * scale - bh) / 2;
+    const fr = this.box.querySelector('.aimbox');
+    const r = fr.offsetWidth ? { x: fr.offsetLeft, y: fr.offsetTop - fr.offsetHeight / 2, w: fr.offsetWidth, h: fr.offsetHeight }
+      : { x: bw * 0.07, y: bh / 2 - bw * 0.086, w: bw * 0.86, h: bw * 0.172 }; // fallback = CSS values
+    const cx = (r.x + r.w / 2 + offX) / scale, cy = (r.y + r.h / 2 + offY) / scale;
+    // A little wider than the frame (white margins), and taller (1D code: any line across the bars is enough,
+    // labels above/below are far away).
+    // Product barcodes (short, usually alone on the pack): allow more room around the frame, then tighter.
+    const ean = this.box.classList.contains('ean');
+    const W = (r.w * 1.06) / scale, H = Math.min(v.videoHeight, (r.h * 1.8) / scale);
+    for (const f of this.detector ? [ean ? 1.4 : 1] : ean ? [1.4, 1.15, 1, 0.8] : [1, 0.85, 0.7, 0.55]) {
+      const sw = Math.min(v.videoWidth, Math.round(W * f)), sh = Math.round(H);
+      const sx = Math.max(0, Math.min(v.videoWidth - sw, Math.round(cx - sw / 2)));
+      const sy = Math.max(0, Math.min(v.videoHeight - sh, Math.round(cy - sh / 2)));
+      const text = await this.decodeRegion(sx, sy, sw, sh);
       if (text) return text;
     }
     return null;
@@ -1146,6 +1157,8 @@ function render() {
     CREW: crewHtml, DATA: dataHtml, EXPIRY: expiryScreenHtml,
   })[S.screen]();
   const slot = $('#camSlot');
+  // Frame shape: lot labels (wide strip) on Issue, product barcode EAN/UPC (3 : 2) when linking on Lot detail.
+  Cam.box.classList.toggle('ean', S.screen === 'LOT_DETAIL' && !!S.waitingForEan);
   if (slot) { slot.append(Cam.box); Cam.start((c, captured) => onScan(c, !captured)); Cam.applyMode(); } else if (Cam.stream || Cam.onCode) Cam.stop();
   setWake(S.screen === 'ISSUE');
   const m = $('#modal');

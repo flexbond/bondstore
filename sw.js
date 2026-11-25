@@ -1,6 +1,6 @@
 /* Offline support: keeps the app's own files on the phone. Data is in IndexedDB, not here.
    When you change any app file, raise VERSION so phones fetch the new files. */
-const VERSION = 'bondstore-1.0.0';
+const VERSION = 'bondstore-1.0.1';
 const FILES = [
   './', './index.html', './app.css', './app.js', './manifest.webmanifest',
   './vendor/zxing.min.js', './vendor/fflate.min.js',

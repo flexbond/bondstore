@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const DEFAULT_LETTER = 'I';
 
 // ================================================================== small helpers
@@ -964,6 +964,7 @@ function dataHtml() {
     <div class="h-sec">Settings</div>
     <div class="row"><div class="grow">Device letter for session numbers<div class="tiny">Next session: ${esc(nextSessionId(S.sessions))}. Android uses S; give every phone its own letter.</div></div>
       <select id="letter" style="width:90px">${letters.map((c) => `<option ${c === S.settings.letter ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
+    <button class="btn out full" data-act="showQr">Install on another phone (QR code)</button>
     <p class="tiny">Storage: ${S.persisted == null ? 'unknown' : S.persisted ? 'kept by the browser (persistent)' : 'may be cleared by the system when space is low – keep backups'} · App ${APP_VERSION}${isStandalone() ? ' · installed' : ''}</p>
   </div>`;
 }
@@ -980,6 +981,19 @@ function expiryScreenHtml() {
   if (later.length) out.push(`<div class="bold navy" style="margin:10px 0 4px">Later (${later.length})</div><div class="list">${later.map((l) => lotRow(l)).join('')}</div>`);
   if (noDate.length) out.push(`<div class="bold" style="color:#80868B;margin:10px 0 4px">No expiry date set (${noDate.length})</div><div class="list">${noDate.map((l) => lotRow(l)).join('')}</div>`);
   return out.join('');
+}
+
+// ---- QR code of the app's own address (to install it on another phone)
+const appUrl = () => location.origin + location.pathname.replace(/index\.html$/, '');
+function qrSvg(text) {
+  try {
+    const m = ZXing.QRCodeEncoder.encode(text, ZXing.QRCodeDecoderErrorCorrectionLevel.M).getMatrix();
+    const n = m.getWidth(), q = 4;
+    let path = '';
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (m.get(x, y) === 1) path += `M${x + q},${y + q}h1v1h-1z`;
+    return `<svg id="qr" viewBox="0 0 ${n + 2 * q} ${n + 2 * q}" width="240" height="240" shape-rendering="crispEdges" style="background:#fff">` +
+      `<path d="${path}" fill="#000"/></svg>`;
+  } catch (e) { return `<p class="red">QR code not available: ${esc(e.message)}</p>`; }
 }
 
 // ---- dialogs
@@ -1031,6 +1045,13 @@ function dialogHtml() {
         const l = S.selectedLot;
         const v = l.expiry || plusMonths(todayYmd(), 6);
         return dlg('Earliest expiry / best before', `<div class="nowrap"><input type="date" id="expDate" value="${v}"></div>`, b('closeDlg', 'Cancel') + b('expirySave', 'Save', ''));
+      }
+      case 'qr': {
+        const url = appUrl();
+        return dlg('Install on another phone', `<div class="nowrap" style="text-align:center">${qrSvg(url)}
+          <div class="name" style="word-break:break-all;margin-top:8px">${esc(url)}</div>
+          <p class="small" style="text-align:left">Scan with the phone's camera app and open the link.<br>iPhone: in <b>Safari</b> → Share → Add to Home Screen.<br>Android: in <b>Chrome</b> → ⋮ → Install app.<br>Each phone keeps its own data: give it its own Device letter.</p></div>`,
+        b('closeDlg', 'Close', ''));
       }
       case 'file': {
         const share = canShareFiles();
@@ -1159,6 +1180,7 @@ const ACT = {
     try { const n = await restoreZip(f); reload(); ok(`Restored ${n} file(s)`); } catch (e) { error('Restore failed: ' + e.message); }
     render();
   },
+  showQr() { S.dialog = { type: 'qr' }; render(); },
   share: shareFile,
   download: downloadFile,
 };

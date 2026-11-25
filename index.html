@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bond Store</title>
+<meta name="description" content="Bond store issuing with barcodes - works offline">
+<meta name="theme-color" content="#1F4E79">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Bond Store">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="top">
+  <button id="back" class="back" hidden>&lsaquo; Back</button>
+  <h1 id="title">Bond Store</h1>
+</header>
+<main id="main"><p class="pad">Loading…</p></main>
+<div id="msg" hidden></div>
+<div id="modal" hidden></div>
+<div id="camHolder" hidden></div>
+
+<!-- File pickers (kept outside the screens so they survive re-drawing) -->
+<input type="file" id="fLots" accept=".csv,text/csv,text/plain,text/comma-separated-values" hidden>
+<input type="file" id="fCrew" accept=".csv,text/csv,text/plain,text/comma-separated-values" hidden>
+<input type="file" id="fRestore" accept=".zip,application/zip,application/x-zip-compressed" hidden>
+<input type="file" id="fPhotoCam" accept="image/*" capture="environment" hidden>
+<input type="file" id="fPhotoLib" accept="image/*" hidden>
+
+<script src="vendor/fflate.min.js"></script>
+<script src="vendor/zxing.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

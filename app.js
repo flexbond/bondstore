@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const APP_VERSION = '1.0.6';
+const APP_VERSION = '1.0.7';
 const DEFAULT_LETTER = 'I';
 
 // ================================================================== small helpers
@@ -156,7 +156,7 @@ const DB = {
 // ================================================================== Repository (port of Repository.kt)
 /** In-memory copies of the data files (crew.csv, lots.csv, ...). Every change is written to IndexedDB. */
 const F = {};
-const DATA_FILES = ['crew.csv', 'lots.csv', 'eanmap.csv', 'names.csv', 'expiry.csv', 'factors.csv', 'sessions.csv', 'issues.csv', 'meta.properties'];
+const DATA_FILES = ['crew.csv', 'lots.csv', 'eanmap.csv', 'names.csv', 'expiry.csv', 'factors.csv', 'oldlots.csv', 'sessions.csv', 'issues.csv', 'meta.properties'];
 let photoKeys = new Set();
 const photoUrls = new Map();
 
@@ -251,6 +251,7 @@ function importLots(text) {
   const rows = Csv.rows(text);
   if (!rows.length) throw new Error('Lots file is empty');
   if (rows[0].lot_code === undefined) throw new Error("Lots file needs a 'lot_code' column");
+  keepOldLots(rows);
   saveFile('lots.csv', text.replace(/^﻿/, ''));
   setMeta('lotsImportTs', Date.now());
   // Phone factors that the new lots file already has (e.g. after Bond Manager's Phone data) are no longer needed.
@@ -263,6 +264,90 @@ function importLots(text) {
     writeMap('factors.csv', ['lot_code', 'factor'], facs);
   }
   return rows.filter((r) => (r.lot_code || '').trim()).length;
+}
+/** Lots that leave the lots file (e.g. a new month without them) are kept in oldlots.csv, so a later lot of
+ *  the same item (new port or price = new lot code) can copy their store name, product barcode and factor. */
+const OLD_LOTS_HEADER = ['lot_code', 'item_code', 'description', 'store_name', 'port', 'price_usd', 'unit', 'factor', 'ean'];
+function keepOldLots(newRows) {
+  const inNew = new Set(newRows.map((r) => (r.lot_code || '').trim().toUpperCase()));
+  const old = new Map();
+  for (const r of [...Csv.rows(F['oldlots.csv'] || ''), ...Csv.rows(F['lots.csv'] || '')]) {
+    const k = (r.lot_code || '').trim().toUpperCase();
+    if (k && !inNew.has(k)) old.set(k, [k, r.item_code || '', r.description || '', r.store_name || '', r.port || '',
+      col(r, 'price_usd', 'price') || '', r.unit || '', r.factor || '', r.ean || '']);
+  }
+  if (!old.size && F['oldlots.csv'] == null) return;
+  saveFile('oldlots.csv', Csv.line(OLD_LOTS_HEADER) + '\n' + [...old.values()].map((v) => Csv.line(v) + '\n').join(''));
+}
+
+// ---- earlier lots of the same item (same item code, other port or price)
+/** All other lots of this lot's item: in the lots file, in oldlots.csv, or known only from the phone's own files. */
+function earlierLots(lot) {
+  const item = (lot.itemCode || '').trim().toUpperCase();
+  if (!item) return [];
+  const names = mapFile('names.csv', 'store_name'), facs = mapFile('factors.csv', 'factor'), extra = loadEanMap();
+  const out = new Map();
+  const add = (code, d) => { if (code && code !== lot.lotCode && !out.has(code)) out.set(code, { code, ...d }); };
+  for (const l of S.lots) if (l.itemCode.trim().toUpperCase() === item) {
+    add(l.lotCode, { port: l.port, price: l.priceUsd, storeName: l.storeName, eans: l.eans, factor: l.factor, current: true });
+  }
+  for (const r of Csv.rows(F['oldlots.csv'] || '')) {
+    const code = (r.lot_code || '').trim().toUpperCase();
+    if ((r.item_code || '').trim().toUpperCase() !== item) continue;
+    const eans = new Set(String(r.ean || '').split(/[ |/]/).map((x) => x.trim()).filter(Boolean));
+    for (const e of extra.get(code) || []) eans.add(e);
+    const f = Csv.num(facs.get(code)) || Csv.num(r.factor) || 1;
+    add(code, { port: r.port || '', price: Csv.num(col(r, 'price_usd', 'price')) ?? 0,
+      storeName: names.has(code) ? names.get(code) : (r.store_name || '').trim(), eans, factor: f > 0 ? f : 1 });
+  }
+  // Lot codes are ITEM-PPP-cents: codes known only from photos, names, barcodes or factors on this phone.
+  const pre = item + '-';
+  const known = new Set([...names.keys(), ...facs.keys(), ...extra.keys(), ...[...photoKeys].map((k) => k.replace(/\.jpg$/, ''))]);
+  for (const code of known) {
+    const m = code.startsWith(pre) && code.slice(pre.length).match(/^([A-Z]{1,3})-(\d+)$/);
+    if (!m) continue;
+    const f = Csv.num(facs.get(code));
+    add(code, { port: m[1], price: Number(m[2]) / 100, storeName: names.get(code) || '', eans: extra.get(code) || new Set(), factor: f > 0 ? f : 1 });
+  }
+  return [...out.values()];
+}
+/** What lot `d` can give `lot`: only things the lot has none of yet. Expiry is never copied (new stock). */
+function copyOffer(lot, d) {
+  const o = {};
+  if (photoKeys.has(photoName(d.code)) && !photoKeys.has(photoName(lot.lotCode))) o.photo = true;
+  if (d.eans.size && !lot.eans.size) o.eans = [...d.eans];
+  if (d.storeName && !lot.storeName) o.storeName = d.storeName;
+  if (d.factor !== 1 && !lot.factorOnPhone && lot.fileFactor === 1) o.factor = d.factor;
+  return Object.keys(o).length ? o : null;
+}
+/** Earlier lots that have something to copy, the one with most to give first. */
+function copySources(lot) {
+  return earlierLots(lot).map((d) => ({ d, o: copyOffer(lot, d) })).filter((x) => x.o)
+    .sort((a, b) => Object.keys(b.o).length - Object.keys(a.o).length);
+}
+function offerText(o) {
+  return [o.photo && 'photo', o.eans && `product barcode ${o.eans.join(', ')}`, o.storeName && `store name "${o.storeName}"`,
+    o.factor && `factor ${factorText(o.factor)}`].filter(Boolean).join(', ');
+}
+/** Copies photo / product barcodes / store name / factor from lot `from` to lot `to`. Returns what was copied. */
+async function copyFromLot(to, from) {
+  const lot = S.lots.find((l) => l.lotCode === to);
+  const src = lot && copySources(lot).find((x) => x.d.code === from);
+  if (!src) return [];
+  const o = src.o, done = [];
+  if (o.photo) {
+    const blob = await DB.get('photos', photoName(from));
+    if (blob) {
+      const n = photoName(to);
+      await DB.put('photos', n, blob); photoKeys.add(n);
+      if (photoUrls.has(n)) { URL.revokeObjectURL(photoUrls.get(n)); photoUrls.delete(n); }
+      done.push('photo');
+    }
+  }
+  if (o.eans) { for (const e of o.eans) repoSetEan(to, e, true); done.push(o.eans.length > 1 ? 'product barcodes' : 'product barcode'); }
+  if (o.storeName) { repoSetStoreName(to, o.storeName); done.push('store name'); }
+  if (o.factor) { repoSetFactor(to, o.factor); done.push('factor'); }
+  return done;
 }
 function writeMap(name, header, map) {
   saveFile(name, Csv.line(header) + '\n' + [...map.entries()].map(([k, v]) => Csv.line([k, v]) + '\n').join(''));
@@ -817,7 +902,18 @@ function bindFileInputs() {
   const readText = (f) => f.text();
   $('#fLots').addEventListener('change', async (e) => {
     const f = e.target.files[0]; if (!f) return;
-    try { const n = importLots(await readText(f)); reload(); ok(`Imported ${n} lots`); } catch (x) { error(x.message); }
+    try {
+      const before = new Set(S.lots.map((l) => l.lotCode));
+      const n = importLots(await readText(f)); reload(); ok(`Imported ${n} lots`);
+      // New lots of an item seen before (new port or price): offer to copy photo, barcode, store name, factor.
+      const fresh = new Set(S.lots.filter((l) => !before.has(l.lotCode)).map((l) => l.lotCode));
+      const list = [];
+      for (const code of fresh) {
+        const s = copySources(S.lots.find((l) => l.lotCode === code)).find((x) => !fresh.has(x.d.code));
+        if (s) list.push({ code, from: s.d.code });
+      }
+      if (list.length) S.dialog = { type: 'copyNew', list };
+    } catch (x) { error(x.message); }
     render();
   });
   $('#fCrew').addEventListener('change', async (e) => {
@@ -996,9 +1092,17 @@ function lotDetailHtml() {
   const l = S.selectedLot;
   const left = stockLeft(l);
   const info = (a, b) => `<div class="info"><div class="l">${esc(a)}</div><div class="v">${b}</div></div>`;
+  const src = S.waitingForEan ? [] : copySources(l);
   return `<div class="stack">
     ${photoHtml(l.lotCode, 'ph260')}
     <div class="btnrow"><button class="btn" data-act="photoCam">Take photo</button><button class="btn out" data-act="photoLib">From gallery</button></div>
+    ${src.length ? `<div class="card" style="padding:10px"><div class="bold navy">Same item as an earlier lot</div>
+      ${src.map(({ d, o }) => `<div class="row" style="margin-top:8px;align-items:flex-start">${photoHtml(d.code, 'ph56')}<div class="grow">
+        <div class="name" style="word-break:break-all">${esc(d.code)}</div>
+        <div class="tiny">Port ${esc(d.port)} · ${Csv.fmt(d.price)} USD${d.current ? '' : ' · no longer in the lots file'}</div>
+        <div class="tiny">Copy: ${esc(offerText(o))}</div></div>
+        <button class="btn text" data-act="copyFromLot" data-code="${esc(d.code)}">Copy</button></div>`).join('')}
+      <div class="tiny" style="margin-top:6px">The expiry date is not copied (new stock).</div></div>` : ''}
     <div style="font-size:20px;font-weight:600">${esc(l.name)}</div>
     <div>${info('ERP name', esc(l.description))}
     <div class="row" style="margin:6px 0"><input type="text" id="storeName" class="grow" placeholder="Store name (as on the product)" value="${esc(l.storeName)}" autocomplete="off">
@@ -1159,6 +1263,20 @@ function dialogHtml() {
           <div class="small orange" style="margin-top:8px">Only new scans use the new factor. Lines already issued keep theirs (reverse and scan again if they are wrong).${l.factorOnPhone ? `<br>Lots file value: ${factorText(l.fileFactor)}` : ''}</div></div>`,
           b('closeDlg', 'Cancel') + (l.factorOnPhone ? b('factorReset', 'Use lots file') : '') + b('factorSave', 'Save', ''));
       }
+      case 'copyNew': {
+        const rows = d.list.map(({ code, from }) => {
+          const l = S.lots.find((x) => x.lotCode === code), s = l && copySources(l).find((x) => x.d.code === from);
+          if (!s) return '';
+          return `<div class="row" style="margin:8px 0;align-items:flex-start">${photoHtml(from, 'ph56')}<div class="grow">
+            <div class="name">${esc(l.name)}</div>
+            <div class="tiny">New: ${esc(l.port)} · ${Csv.fmt(l.priceUsd)} USD &nbsp;←&nbsp; ${esc(s.d.port)} · ${Csv.fmt(s.d.price)} USD</div>
+            <div class="tiny">Copy: ${esc(offerText(s.o))}</div></div></div>`;
+        }).join('');
+        return dlg('New lots of known items', `<div class="nowrap"><p class="small">${d.list.length} new lot(s) are the same item as an earlier lot,
+          with a new port or price. Copy the earlier lot's photo, product barcode, store name and factor?</p>${rows}
+          <p class="tiny">Expiry dates are not copied. New labels are needed for new lots. You can also copy later: Lots &amp; photos → lot.</p></div>`,
+          b('closeDlg', 'Later') + b('copyNewDo', 'Copy all', ''));
+      }
       case 'qr': {
         const url = appUrl();
         return dlg('Install on another phone', `<div class="nowrap" style="text-align:center">${qrSvg(url)}
@@ -1276,6 +1394,21 @@ const ACT = {
     render();
   },
   clearExpiry() { repoSetExpiry(S.selectedLot.lotCode, null); reload(); ok('Expiry date cleared'); render(); },
+  async copyFromLot(el) {
+    const l = S.selectedLot, from = el.dataset.code;
+    try {
+      const done = await copyFromLot(l.lotCode, from); reload();
+      if (done.length) ok(`Copied ${done.join(', ')} from ${from}`); else error('Nothing to copy');
+    } catch (x) { error('Not copied: ' + x.message); }
+    render();
+  },
+  async copyNewDo() {
+    const list = S.dialog.list; S.dialog = null;
+    let n = 0;
+    try { for (const { code, from } of list) if ((await copyFromLot(code, from)).length) { n++; reload(); } } catch (x) { error('Not copied: ' + x.message); }
+    reload(); if (n) ok(`Copied photo / barcode / store name / factor to ${n} new lot(s)`);
+    render();
+  },
   linkEan() { S.waitingForEan = true; render(); },
   stopEan() { S.waitingForEan = false; render(); },
   unlinkEan() { repoSetEan(S.selectedLot.lotCode, null, false); reload(); ok('Product barcodes removed (codes from the lots file stay)'); render(); },

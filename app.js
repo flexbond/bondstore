@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const APP_VERSION = '1.0.7';
+const APP_VERSION = '1.0.8';
 const DEFAULT_LETTER = 'I';
 
 // ================================================================== small helpers
@@ -76,6 +76,22 @@ const fmtF = (v) => { const r = Math.round(v * 1e10) / 1e10; return String(r ===
 const piecesOf = (f) => { const p = 1 / f; return Math.abs(p - Math.round(p)) < 1e-3 * p ? Math.round(p) : Math.round(p * 100) / 100; };
 /** 0.0416666667 -> "1/24", 0.5 -> "1/2", 2 -> "2". */
 const factorText = (f) => (f < 1 && Number.isInteger(piecesOf(f)) && Math.abs(1 / piecesOf(f) - f) < 1e-6 ? `1/${piecesOf(f)}` : Csv.fmt(f));
+/** Issue factor = stock inventory qty / pieces, e.g. 1 Btl = 24 pieces -> one scan = 1/24 Btl. */
+const pairFactor = (p) => Math.round((p.inv / p.pieces) * 1e10) / 1e10;
+/** Inventory qty and pieces for a bare factor: 0.0416666667 -> 1 & 24, 2 -> 2 & 1, 0.6666666667 -> 2 & 3. */
+function pairOf(f) {
+  if (!(f > 0)) return { inv: 1, pieces: 1 };
+  for (let u = 1; u <= 12; u++) { const p = u / f, rp = Math.round(p); if (rp >= 1 && Math.abs(p - rp) < 1e-4 * p) return { inv: u, pieces: rp }; }
+  return { inv: 1, pieces: Math.round(1e4 / f) / 1e4 };
+}
+const pairText = (p, unit) => `${Csv.fmt(p.inv)} ${unit || 'unit'} = ${Csv.fmt(p.pieces)} piece${p.pieces === 1 ? '' : 's'}`;
+/** Factor from a lots row: inventory_qty / pieces when both are there, else the factor column. */
+function fileFactorOf(r) {
+  const inv = Csv.num(r.inventory_qty), pcs = Csv.num(r.pieces), f = Csv.num(r.factor);
+  if (inv > 0 && pcs > 0) { const pair = { inv, pieces: pcs }; return { pair, factor: pairFactor(pair) }; }
+  const ff = f > 0 ? f : 1;
+  return { pair: pairOf(ff), factor: ff };
+}
 /** First of the given columns that exists in the row (like Kotlin's r["a"] ?: r["b"]). */
 const col = (r, ...keys) => { for (const k of keys) if (r[k] !== undefined) return r[k]; return undefined; };
 
@@ -170,7 +186,7 @@ const SPECIAL = [['CHARTERER', 'Charterer'], ['OWNER', 'Owner'], ['CLUB', 'Club'
 const SESSION_HEADER = ['id', 'name', 'started_ms', 'closed_ms', 'exported_ms', 'export_file', 'export_count'];
 const ISSUE_HEADER = ['id', 'session', 'timestamp_ms', 'date', 'time', 'person_code', 'person_name', 'report_column',
   'lot_code', 'item_code', 'description', 'port', 'price_usd', 'unit', 'qty', 'factor', 'report_qty', 'note'];
-const LOTS_EXPORT_HEADER = ['lot_code', 'item_code', 'description', 'store_name', 'port', 'price_usd', 'unit', 'factor', 'ean', 'expiry', 'stock'];
+const LOTS_EXPORT_HEADER = ['lot_code', 'item_code', 'description', 'store_name', 'port', 'price_usd', 'unit', 'factor', 'ean', 'expiry', 'stock', 'inventory_qty', 'pieces'];
 const LEGACY_SESSION = 'S0000';
 
 // ---- meta.properties (Java properties, shared with Android backups)
@@ -225,19 +241,19 @@ function loadEanMap() {
 }
 function loadLots() {
   const extra = loadEanMap(), names = mapFile('names.csv', 'store_name'), exps = mapFile('expiry.csv', 'expiry');
-  const facs = mapFile('factors.csv', 'factor');
+  const facs = loadFactorMap();
   return Csv.rows(F['lots.csv'] || '').map((r) => {
     const code = (r.lot_code || '').trim().toUpperCase();
     if (!code) return null;
     const eans = new Set(String(r.ean || '').split(/[ |/]/).map((x) => x.trim()).filter(Boolean));
     for (const e of extra.get(code) || []) eans.add(e);
-    const f = Csv.num(r.factor), fp = Csv.num(facs.get(code));
+    const ff = fileFactorOf(r), fp = facs.get(code);
     const lot = {
       lotCode: code, itemCode: r.item_code || '', description: r.description || '', port: r.port || '',
       priceUsd: Csv.num(col(r, 'price_usd', 'price')) ?? 0, unit: r.unit || '',
       // A factor changed on the phone (factors.csv) wins over the lots file.
-      factor: fp != null && fp > 0 ? fp : f != null && f > 0 ? f : 1, eans,
-      fileFactor: f != null && f > 0 ? f : 1, factorOnPhone: fp != null && fp > 0,
+      factor: fp ? fp.factor : ff.factor, pair: fp ? fp.pair : ff.pair, eans,
+      fileFactor: ff.factor, filePair: ff.pair, factorOnPhone: !!fp,
       stockAtImport: Csv.num(col(r, 'stock', 'rob')),
       storeName: names.has(code) ? names.get(code) : (r.store_name || '').trim(),
       // A date set on the phone (or cleared there) wins over the lots file.
@@ -255,26 +271,26 @@ function importLots(text) {
   saveFile('lots.csv', text.replace(/^﻿/, ''));
   setMeta('lotsImportTs', Date.now());
   // Phone factors that the new lots file already has (e.g. after Bond Manager's Phone data) are no longer needed.
-  const facs = mapFile('factors.csv', 'factor');
+  const facs = loadFactorMap();
   if (facs.size) {
     for (const r of rows) {
       const k = (r.lot_code || '').trim().toUpperCase();
-      if (facs.has(k) && Csv.num(r.factor) != null && Math.abs(Csv.num(r.factor) - (Csv.num(facs.get(k)) ?? 0)) < 1e-6) facs.delete(k);
+      if (facs.has(k) && Math.abs(fileFactorOf(r).factor - facs.get(k).factor) < 1e-9) facs.delete(k);
     }
-    writeMap('factors.csv', ['lot_code', 'factor'], facs);
+    writeFactorMap(facs);
   }
   return rows.filter((r) => (r.lot_code || '').trim()).length;
 }
 /** Lots that leave the lots file (e.g. a new month without them) are kept in oldlots.csv, so a later lot of
  *  the same item (new port or price = new lot code) can copy their store name, product barcode and factor. */
-const OLD_LOTS_HEADER = ['lot_code', 'item_code', 'description', 'store_name', 'port', 'price_usd', 'unit', 'factor', 'ean'];
+const OLD_LOTS_HEADER = ['lot_code', 'item_code', 'description', 'store_name', 'port', 'price_usd', 'unit', 'factor', 'ean', 'inventory_qty', 'pieces'];
 function keepOldLots(newRows) {
   const inNew = new Set(newRows.map((r) => (r.lot_code || '').trim().toUpperCase()));
   const old = new Map();
   for (const r of [...Csv.rows(F['oldlots.csv'] || ''), ...Csv.rows(F['lots.csv'] || '')]) {
     const k = (r.lot_code || '').trim().toUpperCase();
     if (k && !inNew.has(k)) old.set(k, [k, r.item_code || '', r.description || '', r.store_name || '', r.port || '',
-      col(r, 'price_usd', 'price') || '', r.unit || '', r.factor || '', r.ean || '']);
+      col(r, 'price_usd', 'price') || '', r.unit || '', r.factor || '', r.ean || '', r.inventory_qty || '', r.pieces || '']);
   }
   if (!old.size && F['oldlots.csv'] == null) return;
   saveFile('oldlots.csv', Csv.line(OLD_LOTS_HEADER) + '\n' + [...old.values()].map((v) => Csv.line(v) + '\n').join(''));
@@ -285,20 +301,20 @@ function keepOldLots(newRows) {
 function earlierLots(lot) {
   const item = (lot.itemCode || '').trim().toUpperCase();
   if (!item) return [];
-  const names = mapFile('names.csv', 'store_name'), facs = mapFile('factors.csv', 'factor'), extra = loadEanMap();
+  const names = mapFile('names.csv', 'store_name'), facs = loadFactorMap(), extra = loadEanMap();
   const out = new Map();
   const add = (code, d) => { if (code && code !== lot.lotCode && !out.has(code)) out.set(code, { code, ...d }); };
   for (const l of S.lots) if (l.itemCode.trim().toUpperCase() === item) {
-    add(l.lotCode, { port: l.port, price: l.priceUsd, storeName: l.storeName, eans: l.eans, factor: l.factor, current: true });
+    add(l.lotCode, { port: l.port, price: l.priceUsd, storeName: l.storeName, eans: l.eans, factor: l.factor, pair: l.pair, current: true });
   }
   for (const r of Csv.rows(F['oldlots.csv'] || '')) {
     const code = (r.lot_code || '').trim().toUpperCase();
     if ((r.item_code || '').trim().toUpperCase() !== item) continue;
     const eans = new Set(String(r.ean || '').split(/[ |/]/).map((x) => x.trim()).filter(Boolean));
     for (const e of extra.get(code) || []) eans.add(e);
-    const f = Csv.num(facs.get(code)) || Csv.num(r.factor) || 1;
+    const ff = facs.get(code) || fileFactorOf(r);
     add(code, { port: r.port || '', price: Csv.num(col(r, 'price_usd', 'price')) ?? 0,
-      storeName: names.has(code) ? names.get(code) : (r.store_name || '').trim(), eans, factor: f > 0 ? f : 1 });
+      storeName: names.has(code) ? names.get(code) : (r.store_name || '').trim(), eans, factor: ff.factor, pair: ff.pair });
   }
   // Lot codes are ITEM-PPP-cents: codes known only from photos, names, barcodes or factors on this phone.
   const pre = item + '-';
@@ -306,8 +322,8 @@ function earlierLots(lot) {
   for (const code of known) {
     const m = code.startsWith(pre) && code.slice(pre.length).match(/^([A-Z]{1,3})-(\d+)$/);
     if (!m) continue;
-    const f = Csv.num(facs.get(code));
-    add(code, { port: m[1], price: Number(m[2]) / 100, storeName: names.get(code) || '', eans: extra.get(code) || new Set(), factor: f > 0 ? f : 1 });
+    const ff = facs.get(code) || { factor: 1, pair: pairOf(1) };
+    add(code, { port: m[1], price: Number(m[2]) / 100, storeName: names.get(code) || '', eans: extra.get(code) || new Set(), factor: ff.factor, pair: ff.pair });
   }
   return [...out.values()];
 }
@@ -317,7 +333,7 @@ function copyOffer(lot, d) {
   if (photoKeys.has(photoName(d.code)) && !photoKeys.has(photoName(lot.lotCode))) o.photo = true;
   if (d.eans.size && !lot.eans.size) o.eans = [...d.eans];
   if (d.storeName && !lot.storeName) o.storeName = d.storeName;
-  if (d.factor !== 1 && !lot.factorOnPhone && lot.fileFactor === 1) o.factor = d.factor;
+  if (d.factor !== 1 && !lot.factorOnPhone && lot.fileFactor === 1) o.pair = d.pair;
   return Object.keys(o).length ? o : null;
 }
 /** Earlier lots that have something to copy, the one with most to give first. */
@@ -325,9 +341,9 @@ function copySources(lot) {
   return earlierLots(lot).map((d) => ({ d, o: copyOffer(lot, d) })).filter((x) => x.o)
     .sort((a, b) => Object.keys(b.o).length - Object.keys(a.o).length);
 }
-function offerText(o) {
+function offerText(o, unit) {
   return [o.photo && 'photo', o.eans && `product barcode ${o.eans.join(', ')}`, o.storeName && `store name "${o.storeName}"`,
-    o.factor && `factor ${factorText(o.factor)}`].filter(Boolean).join(', ');
+    o.pair && `factor ${pairText(o.pair, unit)}`].filter(Boolean).join(', ');
 }
 /** Copies photo / product barcodes / store name / factor from lot `from` to lot `to`. Returns what was copied. */
 async function copyFromLot(to, from) {
@@ -346,17 +362,34 @@ async function copyFromLot(to, from) {
   }
   if (o.eans) { for (const e of o.eans) repoSetEan(to, e, true); done.push(o.eans.length > 1 ? 'product barcodes' : 'product barcode'); }
   if (o.storeName) { repoSetStoreName(to, o.storeName); done.push('store name'); }
-  if (o.factor) { repoSetFactor(to, o.factor); done.push('factor'); }
+  if (o.pair) { repoSetFactor(to, o.pair); done.push('factor'); }
   return done;
 }
 function writeMap(name, header, map) {
   saveFile(name, Csv.line(header) + '\n' + [...map.entries()].map(([k, v]) => Csv.line([k, v]) + '\n').join(''));
 }
 function repoSetExpiry(code, date) { const m = mapFile('expiry.csv', 'expiry'); m.set(code, date || ''); writeMap('expiry.csv', ['lot_code', 'expiry'], m); }
-function repoSetFactor(code, factor) {
-  const m = mapFile('factors.csv', 'factor');
-  if (factor == null) m.delete(code); else m.set(code, fmtF(factor));
-  writeMap('factors.csv', ['lot_code', 'factor'], m);
+/** factors.csv (set on the phone): lot_code;factor;inventory_qty;pieces. Older files have only lot_code;factor. */
+function loadFactorMap() {
+  const m = new Map();
+  for (const r of Csv.rows(F['factors.csv'] || '')) {
+    const k = (r.lot_code || '').trim().toUpperCase();
+    const inv = Csv.num(r.inventory_qty), pcs = Csv.num(r.pieces), f = Csv.num(r.factor);
+    if (!k) continue;
+    if (inv > 0 && pcs > 0) { const pair = { inv, pieces: pcs }; m.set(k, { pair, factor: pairFactor(pair) }); }
+    else if (f > 0) m.set(k, { pair: pairOf(f), factor: f });
+  }
+  return m;
+}
+function writeFactorMap(m) {
+  saveFile('factors.csv', Csv.line(['lot_code', 'factor', 'inventory_qty', 'pieces']) + '\n' +
+    [...m.entries()].map(([k, v]) => Csv.line([k, fmtF(v.factor), Csv.fmt(v.pair.inv), Csv.fmt(v.pair.pieces)]) + '\n').join(''));
+}
+/** pair = { inv, pieces } (e.g. 1 Btl = 24 pieces), or null = use the lots file again. */
+function repoSetFactor(code, pair) {
+  const m = loadFactorMap();
+  if (pair == null) m.delete(code); else m.set(code, { pair, factor: pairFactor(pair) });
+  writeFactorMap(m);
 }
 /** "0.041667", "1/24", "0,5" -> number > 0, else null. */
 function parseFactor(s) {
@@ -381,6 +414,7 @@ function lotsExportText() {
   return '﻿' + Csv.line(LOTS_EXPORT_HEADER) + '\r\n' + S.lots.map((l) => Csv.line([
     l.lotCode, l.itemCode, l.description, l.storeName, l.port, Csv.fmt(l.priceUsd), l.unit, fmtF(l.factor),
     [...l.eans].sort().join(' '), l.expiry || '', l.stockAtImport != null ? Csv.fmt(l.stockAtImport) : '',
+    Csv.fmt(l.pair.inv), Csv.fmt(l.pair.pieces),
   ]) + '\r\n').join('');
 }
 
@@ -1100,7 +1134,7 @@ function lotDetailHtml() {
       ${src.map(({ d, o }) => `<div class="row" style="margin-top:8px;align-items:flex-start">${photoHtml(d.code, 'ph56')}<div class="grow">
         <div class="name" style="word-break:break-all">${esc(d.code)}</div>
         <div class="tiny">Port ${esc(d.port)} · ${Csv.fmt(d.price)} USD${d.current ? '' : ' · no longer in the lots file'}</div>
-        <div class="tiny">Copy: ${esc(offerText(o))}</div></div>
+        <div class="tiny">Copy: ${esc(offerText(o, l.unit))}</div></div>
         <button class="btn text" data-act="copyFromLot" data-code="${esc(d.code)}">Copy</button></div>`).join('')}
       <div class="tiny" style="margin-top:6px">The expiry date is not copied (new stock).</div></div>` : ''}
     <div style="font-size:20px;font-weight:600">${esc(l.name)}</div>
@@ -1109,7 +1143,8 @@ function lotDetailHtml() {
       <button class="btn text" data-act="saveStoreName">Save</button></div>
     ${info('Port', esc(l.port))}${info('Price', `${Csv.fmt(l.priceUsd)} USD / ${esc(l.unit)}`)}${info('Item code', esc(l.itemCode))}
     ${info('Lot code', esc(l.lotCode))}
-    <div class="info" style="align-items:center"><div class="l">Factor</div><div class="v grow">${factorText(l.factor)} ${esc(l.unit)} per scanned piece${l.factor < 1 ? ` <span class="small">(${piecesOf(l.factor)} pieces per ${esc(l.unit)})</span>` : ''}${l.factorOnPhone ? `<div class="tiny orange">Changed on this phone · lots file: ${factorText(l.fileFactor)}</div>` : ''}</div>
+    <div class="info" style="align-items:center"><div class="l">Issue factor</div><div class="v grow">${esc(pairText(l.pair, l.unit))}
+      <div class="tiny">1 scanned piece = ${fmtF(l.factor)} ${esc(l.unit)}</div>${l.factorOnPhone ? `<div class="tiny orange">Changed on this phone · lots file: ${esc(pairText(l.filePair, l.unit))}</div>` : ''}</div>
       <button class="btn text" data-act="askFactor">Change</button></div>
     ${left != null ? info('In stock', Csv.fmt(left) + ' pieces') : ''}${info('Product barcodes', esc([...l.eans].join(', ') || 'none'))}
     <div class="info" style="align-items:center"><div class="l">Expiry date</div><div class="v grow">${l.expiry ? expiryHtml(l.expiry) : 'not set'}</div>
@@ -1200,11 +1235,19 @@ function dlg(title, body, acts) {
   return `<div class="dlg" role="dialog" aria-modal="true"><h2>${esc(title)}</h2><div class="body">${body}</div><div class="acts">${acts}</div></div>`;
 }
 const b = (act, text, cls = 'text', extra = '') => `<button class="btn ${cls}" data-act="${act}" ${extra}>${esc(text)}</button>`;
+/** The two numbers typed in the factor dialog, or null. */
+function factorPair() {
+  const inv = parseFactor($('#facInv')?.value), pieces = parseFactor($('#facPcs')?.value);
+  return inv && pieces ? { inv, pieces } : null;
+}
 function factorPreview() {
-  const p = $('#facPreview'); if (!p) return;
-  const l = S.selectedLot, f = parseFactor($('#facValue').value);
-  p.innerHTML = f == null ? '<span class="red">Not a valid factor</span>'
-    : `Scanning 3 pieces → <b>${Csv.fmt(3 * f)} ${esc(l.unit)}</b> in the report` + (f < 1 ? ` · ${piecesOf(f)} pieces = 1 ${esc(l.unit)}` : '');
+  const box = $('#facPreview'); if (!box) return;
+  const l = S.selectedLot, u = esc(l.unit || 'unit'), p = factorPair();
+  if (!p) { box.innerHTML = '<span class="red">Enter both numbers (above 0).</span>'; return; }
+  const f = pairFactor(p);
+  box.innerHTML = `<div class="small">Issue value per scanned piece (factor), calculated:</div>
+    <div style="font-size:18px;margin:4px 0">${Csv.fmt(p.inv)} ${u} ÷ ${Csv.fmt(p.pieces)} = <b>${fmtF(f)} ${u}</b></div>
+    <div class="tiny">Example: 3 pieces scanned → ${Csv.fmt(3 * f)} ${u} in the bond report${p.pieces > 1 && Number.isInteger(p.pieces / p.inv) ? ` · ${Csv.fmt(p.pieces / p.inv)} pieces → 1 ${u}` : ''}</div>`;
 }
 function dialogHtml() {
   if (!S.loaded) return '';
@@ -1253,14 +1296,14 @@ function dialogHtml() {
       }
       case 'factor': {
         const l = S.selectedLot, u = esc(l.unit || 'unit');
-        return dlg('Factor per scanned piece', `<div class="nowrap">
-          <div class="small">One scan of this label = how many <b>${u}</b> in the bond report?</div>
-          <label class="small" style="display:block;margin-top:10px">Pieces in one ${u} (e.g. 24 cans in a case)</label>
-          <input type="text" id="facPieces" inputmode="decimal" autocomplete="off" value="${l.factor < 1 ? piecesOf(l.factor) : ''}">
-          <label class="small" style="display:block;margin-top:10px">or Factor (${u} per piece, e.g. 1/24 or 0.041667)</label>
-          <input type="text" id="facValue" inputmode="decimal" autocomplete="off" value="${factorText(l.factor)}">
-          <div class="small" id="facPreview" style="margin-top:8px"></div>
-          <div class="small orange" style="margin-top:8px">Only new scans use the new factor. Lines already issued keep theirs (reverse and scan again if they are wrong).${l.factorOnPhone ? `<br>Lots file value: ${factorText(l.fileFactor)}` : ''}</div></div>`,
+        return dlg('Issue factor', `<div class="nowrap">
+          <div class="small">The bond report counts this lot in <b>${u}</b>. Crew take it in pieces: say how many pieces make the stock quantity.</div>
+          <label class="small" for="facInv" style="display:block;margin-top:10px">Stock inventory quantity (${u}) – usually 1</label>
+          <div class="row"><input type="text" id="facInv" class="grow" inputmode="decimal" autocomplete="off" value="${Csv.fmt(l.pair.inv)}"><span class="bold">${u}</span></div>
+          <label class="small" for="facPcs" style="display:block;margin-top:10px">Number of pieces in it (e.g. 24 cans in 1 case)</label>
+          <div class="row"><input type="text" id="facPcs" class="grow" inputmode="decimal" autocomplete="off" value="${Csv.fmt(l.pair.pieces)}"><span class="bold">pieces</span></div>
+          <div id="facPreview" style="margin-top:10px;padding:8px 10px;background:#eef3f9;border-radius:6px"></div>
+          <div class="small orange" style="margin-top:8px">Only new scans use the new factor. Lines already issued keep theirs (reverse and scan again if they are wrong).${l.factorOnPhone ? `<br>Lots file: ${esc(pairText(l.filePair, l.unit))}` : ''}</div></div>`,
           b('closeDlg', 'Cancel') + (l.factorOnPhone ? b('factorReset', 'Use lots file') : '') + b('factorSave', 'Save', ''));
       }
       case 'copyNew': {
@@ -1270,7 +1313,7 @@ function dialogHtml() {
           return `<div class="row" style="margin:8px 0;align-items:flex-start">${photoHtml(from, 'ph56')}<div class="grow">
             <div class="name">${esc(l.name)}</div>
             <div class="tiny">New: ${esc(l.port)} · ${Csv.fmt(l.priceUsd)} USD &nbsp;←&nbsp; ${esc(s.d.port)} · ${Csv.fmt(s.d.price)} USD</div>
-            <div class="tiny">Copy: ${esc(offerText(s.o))}</div></div></div>`;
+            <div class="tiny">Copy: ${esc(offerText(s.o, l.unit))}</div></div></div>`;
         }).join('');
         return dlg('New lots of known items', `<div class="nowrap"><p class="small">${d.list.length} new lot(s) are the same item as an earlier lot,
           with a new port or price. Copy the earlier lot's photo, product barcode, store name and factor?</p>${rows}
@@ -1376,16 +1419,17 @@ const ACT = {
   askExpiry() { S.dialog = { type: 'expiry' }; render(); },
   askFactor() { S.dialog = { type: 'factor' }; render(); factorPreview(); },
   factorSave() {
-    const l = S.selectedLot, f = parseFactor($('#facValue').value);
-    if (f == null) { error('Enter a factor above 0, e.g. 1, 0.5 or 1/24'); return; }
+    const l = S.selectedLot, p = factorPair();
+    if (!p) { error('Enter the stock inventory quantity (usually 1) and the number of pieces, both above 0'); return; }
+    const f = pairFactor(p);
     S.dialog = null;
-    repoSetFactor(l.lotCode, fmtF(f) === fmtF(l.fileFactor) ? null : f);
-    reload(); ok(`Factor for ${l.lotCode} set to ${factorText(f)} ${l.unit} per piece`); render();
+    repoSetFactor(l.lotCode, fmtF(f) === fmtF(l.fileFactor) ? null : p);
+    reload(); ok(`${l.lotCode}: ${pairText(p, l.unit)} → 1 scanned piece = ${fmtF(f)} ${l.unit}`); render();
   },
   factorReset() {
     const l = S.selectedLot;
     S.dialog = null; repoSetFactor(l.lotCode, null); reload();
-    ok(`Factor back to the lots file value ${factorText(l.fileFactor)}`); render();
+    ok(`Factor back to the lots file: ${pairText(l.filePair, l.unit)}`); render();
   },
   expirySave() {
     const v = $('#expDate').value;
@@ -1466,8 +1510,7 @@ function bindEvents() {
     if (t.id === 'histFilter') { S.hist.filter = t.value; $('#histList').innerHTML = histListHtml(); }
     else if (t.id === 'lotsFilter') { S.lotsFilter = t.value; $('#lotsList').innerHTML = lotsListHtml(); hydratePhotos($('#lotsList')); }
     else if (t.id === 'manual') S.manual = t.value;
-    else if (t.id === 'facPieces') { const n = parseFactor(t.value); if (n) $('#facValue').value = Number.isInteger(n) ? `1/${n}` : fmtF(1 / n); factorPreview(); }
-    else if (t.id === 'facValue') { const f = parseFactor(t.value); $('#facPieces').value = f && f < 1 ? piecesOf(f) : ''; factorPreview(); }
+    else if (t.id === 'facInv' || t.id === 'facPcs') factorPreview();
   });
   // Enter in the code field and in dialogs
   document.addEventListener('keydown', (e) => {
@@ -1476,7 +1519,7 @@ function bindEvents() {
     if (t.id === 'manual') { e.preventDefault(); ACT.manualEnter(); }
     else if (t.id === 'sessName') { e.preventDefault(); ACT.newStart(); }
     else if (t.id === 'storeName') { e.preventDefault(); ACT.saveStoreName(); t.blur(); }
-    else if (t.id === 'facValue' || t.id === 'facPieces') { e.preventDefault(); ACT.factorSave(); }
+    else if (t.id === 'facInv' || t.id === 'facPcs') { e.preventDefault(); ACT.factorSave(); }
   });
   $('#back').addEventListener('click', back);
   $('#msg').addEventListener('click', () => { $('#msg').hidden = true; });
